@@ -1,7 +1,7 @@
 from torch import nn
 import torch
-from network import Unet
-from utils import ProjOperator, FBPOperator, compare, compute_psnr
+from network import Network
+from utils import ProjOperator, FBPOperator, compare, compute_psnr, window_image
 from torch.utils.data import Dataset, DataLoader
 import logging
 import torch.nn.functional as F
@@ -12,6 +12,8 @@ import os
 import pydicom
 from torch.utils.data import Subset
 from skimage.restoration import denoise_tv_chambolle as TV
+import scipy.io as sio
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda:0")
 torch.cuda.set_device(0)
@@ -63,7 +65,8 @@ class DicomDataset(Dataset):
         img_path = self.file_list[idx]
         image = pydicom.read_file(img_path).pixel_array
         image = np.float32(image)
-        image = image / np.max(image)
+        max_value = np.max(image)
+        image = image / max_value
         image[image < 0] = 0
 
         # image = np.expand_dims(image, axis=0)  # add channel dimension
@@ -73,18 +76,19 @@ class DicomDataset(Dataset):
             image = self.transform(image)
 
 
-        return image
+        return image, max_value  # 返回图像和最大值
 
 
-Unet = Unet(img_channel=1, width=32)
+Unet = Network(img_channel=1, width=32)
 Unet.to(device)
 Unet = nn.DataParallel(Unet)
-pretrained_state_dict = torch.load('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0102.pth')
+pretrained_state_dict = torch.load('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0110.pth')
 Unet.load_state_dict(pretrained_state_dict)
 
 val_dataset = DicomDataset('/home/student1/wujia/d2gan_end_to_end/raw_data/test/L***/full_3mm')
 print(len(val_dataset))
-single_image_dataset = Subset(val_dataset, [0])
+image, max_value = val_dataset[3]  # 获取第一个图像和其最大值
+print(max_value)
 
 
 def val_fn(validlow):
@@ -140,29 +144,53 @@ v = np.zeros([nw, nh])
 f1 = np.zeros([nw, nh])
 f2 = np.zeros([nw, nh])
 
-for idx, data in enumerate(single_image_dataset):
-    reference = data
-    print(idx)
-    for iters in range(2000):
-        if iters == 0:
-            Proj1 = radon_pro(reference)
-            Proj11 = radon_pro_label(reference)
-            rawRec = fbp_op_64(Proj1)
-            Proj2 = val_pfn(reference)
-            g_FBP2 = val_fn(reference)
+reference = image
+for iters in range(2000):
+    if iters == 0:
+        Proj1 = radon_pro(reference)
+        Proj11 = radon_pro_label(reference)
+        rawRec = fbp_op_64(Proj1)
+        Proj2 = val_pfn(reference)
+        g_FBP2 = val_fn(reference)
 
-            Rnet = g_FBP2
-            compare(reference, Rnet)
-        else:
-            resimage1 = fbp_op_64(radon_pro(g_FBP2) - Proj1)
-            g_FBP2 = g_FBP2 - 0.1 * (
-                    resimage1  + lambda3 * (
-                    g_FBP2 - Rnet - v - f2)) / (ata + lambda3)
+        Rnet = g_FBP2
+        compare(reference, Rnet)
+    else:
+        resimage1 = fbp_op_64(radon_pro(g_FBP2) - Proj1)
+        g_FBP2 = g_FBP2 - 0.1 * (
+                resimage1  + lambda3 * (
+                g_FBP2 - Rnet - v - f2)) / (ata + lambda3)
 
-            g_FBP3 = g_FBP2 - Rnet - f2
+        g_FBP3 = g_FBP2 - Rnet - f2
 
-            v1 = TV(g_FBP3, weight=deta2, n_iter_max=100)
-            v = v1
-            f2 = f2 + 1.0 * (v - g_FBP2 + Rnet)
-            if iters % 10 == 0:
-                compare(reference, g_FBP2)
+        v1 = TV(g_FBP3, weight=deta2, n_iter_max=100)
+        v = v1
+        f2 = f2 + 1.0 * (v - g_FBP2 + Rnet)
+        if iters % 10 == 0:
+            compare(reference, g_FBP2)
+sio.savemat('/home/w/d2gan_end_to_end/train_odl/compare_experiment/oneshottest_60/results60/mat文件2/ours.mat', {'recon': g_FBP2})
+difference = reference - g_FBP2  # 使用归一化后的g_FBP2计算差异
+
+g_FBP2_normalized = (g_FBP2 - g_FBP2.min()) / (g_FBP2.max() - g_FBP2.min())
+g_FBP2_normalized = np.float32(g_FBP2_normalized)
+
+g_FBP2_windowed = window_image(g_FBP2_normalized*max_value, 40, 400, -1024, 1, rescale=False)
+reference = window_image(reference*max_value, 40, 400, -1024, 1, rescale=False)
+
+fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(15, 5))
+
+ax[0].imshow(reference, cmap='gray')
+ax[0].set_title('Reference')
+ax[0].axis('off')
+
+
+ax[1].imshow(g_FBP2_windowed, cmap='gray')
+ax[1].set_title('DPKA')
+ax[1].axis('off')
+
+
+ax[2].imshow(difference, cmap='gray')
+ax[2].set_title('Difference')
+ax[2].axis('off')
+
+plt.show()

@@ -6,6 +6,55 @@ import torch.nn.init as init
 import math
 
 
+class LayerNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        # print('mu, var', mu.mean(), var.mean())
+        # d.append([mu.mean(), var.mean()])
+        y = (x - mu) / (var + eps).sqrt()
+        weight, bias, y = weight.contiguous(), bias.contiguous(), y.contiguous()  # avoid cuda error
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+
+        N, C, H, W = grad_output.size()
+        # y, var, weight = ctx.saved_variables
+        y, var, weight = ctx.saved_tensors
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
+            dim=0), None
+
+
+class LayerNorm2d(nn.Module):
+
+    def __init__(self, channels, eps=1e-6, requires_grad=True):
+        super(LayerNorm2d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels), requires_grad=requires_grad))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels), requires_grad=requires_grad))
+        self.eps = eps
+
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
 class KBAFunction(torch.autograd.Function):
 
     @staticmethod
@@ -70,57 +119,7 @@ class KBAFunction(torch.autograd.Function):
         return dx, datt, None, None, dselfb, dselfw
 
 
-class LayerNormFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        # print('mu, var', mu.mean(), var.mean())
-        # d.append([mu.mean(), var.mean()])
-        y = (x - mu) / (var + eps).sqrt()
-        weight, bias, y = weight.contiguous(), bias.contiguous(), y.contiguous()  # avoid cuda error
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-
-        N, C, H, W = grad_output.size()
-        # y, var, weight = ctx.saved_variables
-        y, var, weight = ctx.saved_tensors
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
-            dim=0), None
-
-
-
-class LayerNorm2d(nn.Module):
-
-    def __init__(self, channels, eps=1e-6, requires_grad=True):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels), requires_grad=requires_grad))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels), requires_grad=requires_grad))
-        self.eps = eps
-
-    def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
-
-
-class SimpleGate(nn.Module):
-    def forward(self, x):
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
-
 class NonLocalSparseAttention(nn.Module):
-    """This repository is for NLSN introduced in the following paper "Image Super-Resolution with Non-Local Sparse Attention", CVPR2021"""
     def __init__( self, n_hashes=4, channels=64, k_size=3, reduction=4, chunk_size=144, conv=common.default_conv, res_scale=1):
         super(NonLocalSparseAttention,self).__init__()
         self.chunk_size = chunk_size
@@ -229,7 +228,7 @@ class NonLocalSparseAttention(nn.Module):
         
         ret = ret.permute(0,2,1).view(N,-1,H,W).contiguous()*self.res_scale+input
         return ret
-    
+
 class Swish(nn.Module):
     """
     ### Swish actiavation function
@@ -293,9 +292,10 @@ class ResidualBlock(nn.Module):
         return h + self.shortcut(x)
     
 
-class MFF(nn.Module):
+
+class MFF_s(nn.Module):
     def __init__(self, c, DW_Expand=2, FFN_Expand=2, nset=32, k=3, gc=4, lightweight=False, use_non_local=True):
-        super(MFF, self).__init__()
+        super(MFF_s, self).__init__()
         self.k, self.c = k, c
         self.nset = nset
         dw_ch = int(c * DW_Expand)
@@ -318,6 +318,7 @@ class MFF(nn.Module):
                       groups=1, bias=True),
         )
 
+        # self.non_local_block = NONLocalBlock2D(in_channels=c)
         self.non_local_block = NonLocalSparseAttention(
             n_hashes=4,
             channels=c,
@@ -414,11 +415,12 @@ class MFF(nn.Module):
 
         x = self.dropout2(x)
         return y + x * self.gamma
+    
 
 
-class Unet(nn.Module):
+class Network(nn.Module):
     def __init__(self, img_channel=1, width=32, middle_blk_num=2, enc_blk_nums=[2, 2, 2, 2],
-                 dec_blk_nums=[2, 2, 2, 2], basicblock='MFF', lightweight=True, ffn_scale=1):
+                 dec_blk_nums=[2, 2, 2, 2], basicblock='MFF_s', lightweight=True, ffn_scale=1):
         super().__init__()
         basicblock = eval(basicblock)
 
@@ -498,7 +500,9 @@ class Unet(nn.Module):
         return x
 
 
-# net = Unet(img_channel=1, width=32).cuda()
+
+
+# net = Network(img_channel=1, width=32).cuda()
 # print(net)
 # total_params = sum(p.numel() for p in net.parameters())
 # print(f'{total_params:,} total parameters.')
@@ -511,5 +515,4 @@ class Unet(nn.Module):
 
 # # 打印输出张量的形状
 # print("Output tensor shape:", output_tensor.shape)
-
 

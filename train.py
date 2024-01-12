@@ -1,6 +1,6 @@
 from torch import nn
 import torch
-from network import Unet
+from network import Network
 from utils import ProjOperator, FBPOperator, compare, DicomDataset, compute_psnr
 from torch.utils.data import Dataset, DataLoader
 import logging
@@ -8,15 +8,18 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
+import pydicom
+import glob
+import os
 
 
 device = torch.device("cuda:0")
 torch.cuda.set_device(0)
 
-Unet = Unet(img_channel=1, width=32)
+Unet = Network(img_channel=1, width=32)
 Unet.to(device)
 Unet = nn.DataParallel(Unet)
-# pretrained_state_dict = torch.load('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0102.pth')
+# pretrained_state_dict = torch.load('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_pic_0104.pth')
 # Unet.load_state_dict(pretrained_state_dict)
 size=512
 angles=64
@@ -34,6 +37,47 @@ fbp_op_angel = FBPOperator(N=size, M=size, pixel_size_x=0.15, pixel_size_y=0.15,
                  det_pixels=624, det_pixel_size=0.2, angles=angles, src_origin=950,
                  det_origin=200, filter_type='Ram-Lak', frequency_scaling=0.7)
 
+
+
+
+
+class DicomDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        """
+        Args:
+            root_dir (string): Directory with all the DICOM images.
+            transform (callable, optional): Optional transform to be applied on an image.
+            size (int, optional): The size to which the images will be resized.
+
+        """
+        self.root_dir = root_dir
+        self.transform = transform
+        self.size = size
+        self.file_list = glob.glob(os.path.join(self.root_dir, '**/*.IMA'), recursive=True)
+
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        img_path = self.file_list[idx]
+        image = pydicom.read_file(img_path).pixel_array
+        image = np.float32(image)
+        image = image / np.max(image)
+        image[image < 0] = 0
+
+        image = np.expand_dims(image, axis=0)  # add channel dimension
+        image = torch.from_numpy(image)
+
+        if self.transform:
+            image = self.transform(image)
+
+
+        return image
+    
 dataset = DicomDataset('/home/w/d2gan_end_to_end/raw_data/full_3mm/L***/full_3mm')
 print(len(dataset))
 
@@ -43,9 +87,10 @@ print(len(val_dataset))
 loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 val_loader = DataLoader(val_dataset, batch_size=2, shuffle=True, num_workers=4)
 
-learning_rate = 8e-4  # or any other value you want to set
-optimizer = torch.optim.AdamW(Unet.parameters(), lr=learning_rate, weight_decay=1e-4, betas=(0.9, 0.999))
+learning_rate = 5e-4  # or any other value you want to set
+optimizer = torch.optim.AdamW(Unet.parameters(), weight_decay=1e-5, lr=learning_rate, betas=(0.9, 0.999))
 t_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+
 
 # Loss functions
 l1_loss = torch.nn.L1Loss()
@@ -97,7 +142,8 @@ for epoch in range(100):
 
         # Pass the reconstructed CT back through the UNet
         unet_output2 = Unet(ct_recon)
-        
+        # unet_output2 = unet_output2 - fbp_op_angel(radon_pro(unet_output2) - proj_64)
+
 
         # Compute the third L1 loss
         loss3 = l1_loss(unet_output2, data)
@@ -105,7 +151,6 @@ for epoch in range(100):
         # Combine the losses
         total_loss = 0.1 * loss1 + 0.1 * loss2 + loss3
 
-        # unet_output2 = unet_output2 - fbp_op_angel(radon_pro(unet_output2) - proj_64)
 
         # total_loss = mse_loss(data, unet_output2)
 
@@ -127,7 +172,7 @@ for epoch in range(100):
         loop.set_description(f"Epoch [{epoch + 1}/100]")
         loop.set_postfix(avg_train_loss=running_total_loss / (j + 1), avg_train_mse=running_mse_value / (j + 1),
                          avg_train_psnr=running_psnr_value / (j + 1))
-    t_scheduler.step()
+    # t_scheduler.step()
 
     # Begin validation
     Unet.eval()  # Set the model to evaluation mode
@@ -138,6 +183,9 @@ for epoch in range(100):
         val_loop = tqdm(enumerate(val_loader), total=len(val_loader), leave=False)
         for i, val_data in val_loop:
             val_data = val_data.to(device)
+            # t = diffusion.sample_timesteps(val_data.shape[0]).to(device)
+
+            # Your forward pass and loss computation code here for validation...
             val_proj_64 = radon_pro(val_data)
             val_proj_192_lable = radon_pro_label(val_data)
             val_proj_192 = F.interpolate(val_proj_64, size=(192, val_proj_64.shape[3]))
@@ -147,9 +195,10 @@ for epoch in range(100):
             val_ct_recon = fbp_op(val_unet_output)
             val_loss2 = l1_loss(val_data, val_ct_recon)
             val_unet_output2 = Unet(val_ct_recon)
+            # val_unet_output2 = val_unet_output2 - fbp_op_angel(radon_pro(val_unet_output2) - val_proj_64)
+
             val_loss3 = l1_loss(val_unet_output2, val_data)
             val_total_loss = 0.1 * val_loss1 + 0.1 * val_loss2 + val_loss3
-            # val_unet_output2 = val_unet_output2 - fbp_op_angel(radon_pro(val_unet_output2) - val_proj_64)
 
             # val_total_loss = mse_loss(val_data, val_unet_output2)
             with torch.no_grad():
@@ -160,6 +209,7 @@ for epoch in range(100):
                 running_val_mse +=  mse_recon.item()
                 running_val_psnr += psnr_recon.item()
 
+            # 更新进度条
             val_loop.set_description(f'Validation Epoch [{epoch + 1}/100]')
             val_loop.set_postfix(avg_val_loss=running_val_loss / (i + 1), avg_val_mse=running_val_mse / (i + 1),
                                  avg_val_psnr=running_val_psnr / (i + 1))
@@ -199,7 +249,7 @@ for epoch in range(100):
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save(Unet.state_dict(), '/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0102.pth')
+        torch.save(Unet.state_dict(), '/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0110.pth')
         best_val_image = val_unet_output2.cpu().numpy()
         data_phantom = val_data.cpu().numpy()
         difference_image = np.abs(best_val_image - data_phantom)
@@ -221,4 +271,4 @@ for epoch in range(100):
     })
 
     # Save the DataFrame to a csv file with index
-    metrics_df.to_csv('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_0102.csv')
+    metrics_df.to_csv('/home/w/d2gan_end_to_end/train_odl/resutlt_60_512/my_model_pic_0104.csv')

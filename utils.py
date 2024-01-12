@@ -102,7 +102,7 @@ class ProjOperator:
             shape=[self.N, self.M], dtype='float32')
 
         # create angle partition
-        grid = odl.uniform_grid(0, 2 * np. pi,
+        grid = odl.uniform_grid(0, np.pi + 3.6 * np.pi / 18 - 21.6 * np.pi / 18 / self.angles + 0,
                                 self.angles)
         angle_partition = odl.uniform_partition_fromgrid(grid)
 
@@ -131,7 +131,7 @@ class ProjOperator:
 
     def __call__(self, img):
         return self.forward(img)
-    
+
 class FBPOperator:
     def __init__(self, N=512, M=512, pixel_size_x=0.15, pixel_size_y=0.15,
                  det_pixels=624, det_pixel_size=0.2, angles=720, src_origin=950,
@@ -155,7 +155,7 @@ class FBPOperator:
             shape=[self.N, self.M], dtype='float32')
 
         # create angle partition
-        grid = odl.uniform_grid(0,2 * np. pi,
+        grid = odl.uniform_grid(0, np.pi + 3.6 * np.pi / 18 - 21.6 * np.pi / 18 / self.angles + 0,
                                 self.angles)
         self.angle_partition = odl.uniform_partition_fromgrid(grid)
 
@@ -187,7 +187,7 @@ class FBPOperator:
         # if using cuda
         if isinstance(proj, torch.Tensor):
             fwd_op_adj_mod = OperatorModule(self.ray_trafo.adjoint)
-            parker_weighted_fbp_mod = OperatorModule(self.parker_weighted_fbp )
+            parker_weighted_fbp_mod = OperatorModule(self.parker_weighted_fbp)
             reconstructed_img = parker_weighted_fbp_mod(proj)
         else:
             reconstructed_img = self.parker_weighted_fbp(proj).data
@@ -203,6 +203,16 @@ def compute_psnr(img1, img2):
         return 100
     PIXEL_MAX = 1
     return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
+
+def window_image(img, window_center, window_width, intercept, slope, rescale=True):
+    img = (img * slope + intercept)  # for translation adjustments given in the dicom file.
+    img_min = window_center - window_width // 2  # minimum HU level
+    img_max = window_center + window_width // 2  # maximum HU level
+    img[img < img_min] = img_min  # set img_min for all HU levels less than minimum HU level
+    img[img > img_max] = img_max  # set img_max for all HU levels higher than maximum HU level
+    if rescale:
+        img = (img - img_min) / (img_max - img_min)
+    return img
     
 # x =np.float32(pydicom.read_file('/home/w/fpb_untrain/2755.IMA').pixel_array)
 # x = x / np.max(x)
